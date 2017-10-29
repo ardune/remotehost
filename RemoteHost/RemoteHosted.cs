@@ -1,93 +1,86 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Collections.ObjectModel;
 using System.Diagnostics;
+using System.Linq;
 using System.Linq.Expressions;
+using System.Runtime.CompilerServices;
 using System.Text;
 using System.Threading;
+using RemoteHost.Logging;
+using RemoteHost.Messages;
+using RemoteHost.ProcessHosting;
+using RemoteHost.Serialization;
 
 namespace RemoteHost
 {
-    public class RemoteHosted<THosted, TRunHarness> : IRemostHosted<THosted>
+    public class RemoteHosted<THosted> : IRemoteHosted<THosted>
         where THosted : class, new() 
-        where TRunHarness : class, IRunHarness
     {
-        private bool isDisposed;
-        private Process hostedProcess;
-        private readonly string assemblyLocation;
-        private readonly List<string> pending = new List<string>();
-        private readonly Queue<string> buffer = new Queue<string>();
-        private readonly Dictionary<string,MessageResult> results = new Dictionary<string,MessageResult>();
+        private bool disposed;
 
-        private readonly CancellationTokenSource tokenSource = new CancellationTokenSource();
+        private readonly IProcessFactory processFactory;
+        private readonly object remoteSync = new object();
+        private readonly IMessageSerializer messageSerializer;
+        private readonly Dictionary<Guid, RemoteHostMessageResult> results = new Dictionary<Guid, RemoteHostMessageResult>();
 
-        private readonly object inputSync = new object();
-        private readonly object bufferSync = new object();
-        private readonly object resultSync = new object();
+        private IProcess hostedProcess;
 
-
-        public RemoteHosted()
+        public RemoteHosted(IProcessFactory processFactory, IMessageSerializer messageSerializer)
         {
-            assemblyLocation =  typeof(TRunHarness).Assembly.Location;
+            this.processFactory = processFactory;
+            this.messageSerializer = messageSerializer;
         }
 
         public TResult Call<TResult>(Expression<Func<THosted, TResult>> methodCall)
         {
-            throw new NotImplementedException();
-        }
-
-        public void Start()
-        {
-            if (hostedProcess == null)
+            lock (remoteSync)
             {
-                StartProcess();
-                InitilizeProcessEnvironment();
-            }
-        }
-
-        public void Stop()
-        {
-            if (hostedProcess != null)
-            {
-                Execute(new Message
+                DisposeGuard();
+                var body = methodCall.Body as MethodCallExpression;
+                if (body == null)
                 {
-                    MessageType = MessageType.Shutdown
-                });
-            }
-        }
+                    throw new ArgumentException("expected a method call from " + methodCall);
+                }
 
-        private void InitilizeProcessEnvironment()
-        {
-            var type = string.Join("\n", typeof(THosted).Assembly.FullName, typeof(THosted).AssemblyQualifiedName);
-            Execute(new Message
-            {
-                MessageType = MessageType.LoadClass,
-                Argument = Encoding.UTF8.GetBytes(type)
-            });
-        }
-
-        private MessageResult Execute(Message value)
-        {
-            lock (inputSync)
-            {
-                pending.Add(value.CallIdentifier);
-                hostedProcess.StandardInput.WriteLine(value.CallIdentifier);
-                hostedProcess.StandardInput.WriteLine(value.MessageType);
-                hostedProcess.StandardInput.WriteLine(Convert.ToBase64String(value.Argument));
-            }
-            return WaitForResult(value);
-        }
-
-        private MessageResult WaitForResult(Message value)
-        {
-            var key = value.CallIdentifier;
-            lock (resultSync)
-            {
-                while (!isDisposed)
+                if (body.Method.DeclaringType is THosted)
                 {
-                    if (results.ContainsKey(key))
+                    throw new ArgumentException("expected a method call from the type " + typeof(THosted) +
+                                                " instead got a method from " + body.Method.DeclaringType);
+                }
+
+                var parameters = ExtractParameters(methodCall.Parameters, body).ToArray();
+
+                var callMethod = new CallMethodMessage
+                {
+                    Returns = true,
+                    Arguments = parameters,
+                    MethodName = body.Method.Name
+                };
+
+                var result = SynchroniousCall(callMethod);
+
+                throw new NotImplementedException();
+            }
+
+        }
+
+        private RemoteHostMessage SynchroniousCall(RemoteHostMessage message)
+        {
+            lock (remoteSync)
+            {
+                DisposeGuard();
+
+                var bytes = messageSerializer.Serialize(message);
+
+                hostedProcess.Send(bytes);
+
+                while (!disposed && hostedProcess.IsRunning)
+                {
+                    if (results.ContainsKey(message.MessageIdentifier))
                     {
-                        var result = results[key];
-                        results.Remove(key);
+                        var result = results[message.MessageIdentifier];
+                        results.Remove(message.MessageIdentifier);
                         if (result.Exception != null)
                         {
                             throw result.Exception;
@@ -95,134 +88,85 @@ namespace RemoteHost
                         return result;
                     }
 
-                    Monitor.Wait(resultSync);
+                    Monitor.Wait(remoteSync);
                 }
                 return null;
             }
         }
 
-
-        private void StartProcess()
+        public void Stop()
         {
-            var startInfo = new ProcessStartInfo
-            {
-                CreateNoWindow = true,
-                RedirectStandardOutput = true,
-                RedirectStandardInput = true,
-                UseShellExecute = false,
-                FileName = assemblyLocation
-            };
-
-            hostedProcess = new Process
-            {
-                StartInfo = startInfo,
-                EnableRaisingEvents = true
-            };
-
-            hostedProcess.OutputDataReceived += HandleOutput;
-            hostedProcess.Start();
-            hostedProcess.BeginOutputReadLine();
+            throw new NotImplementedException();
         }
 
-        private void HandleOutput(object sender, DataReceivedEventArgs e)
+
+        public void Start()
         {
-            Trace.WriteLine("HandleOutput");
-            if (string.IsNullOrWhiteSpace(e.Data))
+            lock (remoteSync)
             {
-                Trace.WriteLine("no data");
-                return;
-            }
-            Trace.WriteLine(e.Data);
-            lock (bufferSync)
-            {
-                buffer.Enqueue(e.Data);
-            }
-            TryParse();
-        }
-
-        private void TryParse()
-        {
-            var newResults = new List<MessageResult>();
-            lock (bufferSync)
-            {
-                while (buffer.Count>=2)
+                DisposeGuard();
+                if (hostedProcess != null)
                 {
-                    var identifier = buffer.Dequeue();
-                    var result = buffer.Dequeue();
-                    newResults.Add(new MessageResult
-                    {
-                        CallIdentifier = identifier,
-                        Result = result
-                    });
+                    TraceHelper.WriteLine(TraceLevel.Warning, "attempted to start process when one was already started");
+                    return;
                 }
-            }
+                hostedProcess = processFactory.CreateProcess();
+                hostedProcess.EventOccured += HostedProcessOnEventOccured;
 
-            lock (resultSync)
-            {
-                foreach (var messageResult in newResults)
+                hostedProcess.Start(new StartupParameters
                 {
-                    results[messageResult.CallIdentifier] = messageResult;
-                }
-
-                Monitor.PulseAll(resultSync);
+                    {StartupParameters.MessageSerializer, messageSerializer.GetType().AssemblyQualifiedName},
+                    {StartupParameters.HostedType, typeof(THosted).AssemblyQualifiedName},
+                });
             }
         }
 
-        protected virtual void Dispose(bool disposing)
+        private void HostedProcessOnEventOccured(object sender, ProcessEvent processEvent)
         {
-            if (!isDisposed)
+            lock (remoteSync)
             {
-                if (disposing)
+                switch (processEvent.Type)
                 {
-                    if (hostedProcess != null)
-                    {
-                        hostedProcess.Kill();
-                        hostedProcess.Dispose();
-                    }
-                }
-
-                // TODO: free unmanaged resources (unmanaged objects) and override a finalizer below.
-                // TODO: set large fields to null.
-                hostedProcess = null;
-
-                isDisposed = true;
-                if (disposing)
-                {
-                    Monitor.PulseAll(resultSync);
+                    case ProcessEventType.DataReceived:
+                        var message = messageSerializer.Deserialize(processEvent.Data);
+                        results[message.MessageIdentifier] = message as RemoteHostMessageResult;
+                        Monitor.PulseAll(remoteSync);
+                        return;
+                    case ProcessEventType.ProcessStopped:
+                        Monitor.PulseAll(remoteSync);
+                        return;
                 }
             }
         }
-        
-        ~RemoteHosted()
+
+        // see: https://stackoverflow.com/a/3766713
+        private static IEnumerable<object> ExtractParameters(IReadOnlyCollection<ParameterExpression> parameters, MethodCallExpression body)
         {
-            Dispose(false);
+            var arguments = body.Arguments;
+            foreach (var argument in arguments)
+            {
+                var lambda = Expression.Lambda(argument, parameters);
+                var d = lambda.Compile();
+                yield return d.DynamicInvoke(new object[1]);
+            }
+        }
+
+        private void DisposeGuard([CallerMemberName] string callerName = "")
+        {
+            if (disposed)
+            {
+                throw new ObjectDisposedException(callerName, $"cannot call {callerName} on a disposed instance");
+            }
         }
         
         public void Dispose()
         {
-            Dispose(true);
-            GC.SuppressFinalize(this);
+            lock (remoteSync)
+            {
+                hostedProcess?.Dispose();
+                hostedProcess = null;
+                disposed = true;
+            }
         }
-    }
-
-    public sealed class MessageResult
-    {
-        public string CallIdentifier;
-        public Exception Exception;
-        public object Result;
-    }
-
-    public sealed class Message
-    {
-        public string CallIdentifier = Guid.NewGuid().ToString("N");
-        public MessageType MessageType;
-        public byte[] Argument = new byte[0];
-    }
-
-    public enum MessageType
-    {
-        NoOp,
-        LoadClass,
-        Shutdown
     }
 }

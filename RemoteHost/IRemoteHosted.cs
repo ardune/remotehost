@@ -3,10 +3,11 @@ using System.Linq.Expressions;
 
 namespace RemoteHost
 {
-    public interface IRemostHosted<THosted> : IDisposable
+    public interface IRemoteHosted<THosted> : IDisposable
         where THosted : class, new()
     {
         void Start();
+        void Stop();
 
         /// <summary>
         /// Call a method in THosted class that has a return type.
